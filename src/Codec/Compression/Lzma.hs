@@ -1,4 +1,6 @@
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE PatternSynonyms #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 -- |
 -- Module      : Codec.Compression.Lzma
@@ -30,7 +32,9 @@ module Codec.Compression.Lzma
     , compressST
 
       -- ** Decompression
-    , DecompressStream(..)
+    , DecompressStream
+    , SeekableDecompressStream(..)
+    , SeekRequest(..)
     , decompressIO
     , decompressST
     , LzmaRet(..)
@@ -69,8 +73,10 @@ import           Data.ByteString               (ByteString)
 import qualified Data.ByteString               as BS
 import qualified Data.ByteString.Lazy          as BSL
 import qualified Data.ByteString.Lazy.Internal as BSL
+import           Data.Void                     (Void)
 import           GHC.IO                        (noDuplicate)
 import           LibLzma
+import           System.IO                     (SeekMode)
 
 -- | Decompress lazy 'ByteString' from the @.xz@ format
 decompress :: BSL.ByteString -> BSL.ByteString
@@ -83,9 +89,10 @@ decompress = decompressWith defaultDecompressParams
 decompressWith :: DecompressParams -> BSL.ByteString -> BSL.ByteString
 decompressWith parms input = runST (decompress' input)
   where
-    decompress' :: BSL.ByteString -> ST s BSL.ByteString
+    decompress' :: forall s. BSL.ByteString -> ST s BSL.ByteString
     decompress' ibs0 = loop ibs0 =<< decompressST parms
       where
+        loop :: BSL.ByteString -> DecompressStream (ST s) -> ST s (BSL.ByteString)
         loop BSL.Empty  (DecompressStreamEnd rest)
           | BS.null rest = return BSL.Empty
           | otherwise = fail "Codec.Compression.Lzma.decompressWith: trailing data"
@@ -256,11 +263,31 @@ compressST parms = strictToLazyST (newEncodeLzmaStream parms) >>=
 
 --------------------------------------------------------------------------------
 
-data DecompressStream m =
-     DecompressInputRequired (ByteString -> m (DecompressStream m)) -- ^ Decoding process requires input to proceed. An empty 'ByteString' chunk signals end of input.
-   | DecompressOutputAvailable !ByteString (m (DecompressStream m)) -- ^ Decompressed output chunk available.
+-- | @'DecompressStream' m@ is the unfolding of the decompression process where
+-- you provide a sequence of compressed data chunks as input and receive a
+-- sequence of uncompressed data chunks as output. The process is incremental,
+-- in that the demand for input and provision of output are interleaved.
+--
+-- This process doesn't support random seek.
+type DecompressStream = SeekableDecompressStream Void
+
+-- | @'SeekableDecompressStream' seek m@ is the unfolding of the decompression
+-- process that supports random seek.
+--
+-- The @seek@ parameter indicates the type of seek requests. Use 'SeekRequest'
+-- for random seek. For sequential aceess (i.e. 'DecompressStream') 'Void' is
+-- used.
+data SeekableDecompressStream seek m =
+     DecompressInputRequired (ByteString -> m (SeekableDecompressStream seek m)) -- ^ Decoding process requires input to proceed. An empty 'ByteString' chunk signals end of input.
+   | DecompressSeekRequested !seek (m (SeekableDecompressStream seek m)) -- ^ Random seek is requested.
+   | DecompressOutputAvailable !ByteString (m (SeekableDecompressStream seek m)) -- ^ Decompressed output chunk available.
    | DecompressStreamEnd ByteString -- ^ Decoded stream is finished. Any unconsumed leftovers from the input stream are returned via the 'ByteString' field
    | DecompressStreamError !LzmaRet -- TODO define subset-enum of LzmaRet
+
+data SeekRequest = SeekRequest
+    { seekRequestMode :: !SeekMode
+    , seekRequestOffset :: !Integer
+    } deriving Show
 
 -- | Incremental decompression in the 'IO' monad.
 decompressIO :: DecompressParams -> IO (DecompressStream IO)
