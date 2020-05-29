@@ -1,4 +1,6 @@
 {-# LANGUAGE RecordWildCards, DeriveDataTypeable #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE PatternSynonyms #-}
 
 -- Copyright (c) 2014, Herbert Valerio Riedel <hvr@gnu.org>
 --
@@ -10,22 +12,63 @@
 -- See @<lzma.h>@ header file for documentation about primitives not
 -- documented here
 module LibLzma
-    ( LzmaStream
-    , LzmaRet(..)
-    , IntegrityCheck(..)
-    , CompressionLevel(..)
+    ( -- * Stream
+      LzmaStream
+    -- ** Stream accessors
+    , getStreamAvailIn
+    , getStreamNextIn
+    , getStreamNextOut
+    , getStreamTotalIn
+    , getStreamTotalOut
 
+    , setStreamAvailIn
+    , setStreamNextIn
+    , setStreamNextOut
+    , setStreamTotalIn
+    , setStreamTotalOut
+
+    -- ** Constructing decompression stream
     , newDecodeLzmaStream
     , DecompressParams(..)
     , defaultDecompressParams
 
+    -- ** Constructing compression stream
     , newEncodeLzmaStream
     , CompressParams(..)
     , defaultCompressParams
 
+    -- ** Running a stream
     , runLzmaStream
+
+    -- ** Destructors
     , endLzmaStream
+
+    -- * Block
+    , LzmaBlock
+    , newBlock
+
+    -- * Stream flags
+    , LzmaStreamFlags
+    , newStreamFlags
+    , getStreamFlagsCheck
+    , getStreamFlagsVersion
+    , getStreamFlagsBackwardSize
+
+    -- * Index and index iterator
+    , LzmaIndex
+    , withIndexForeignPtr
+    , LzmaIndexIter
+
+    -- * Misc
+    , LzmaRet(..)
+    , IntegrityCheck(IntegrityCheckNone, IntegrityCheckCrc32, IntegrityCheckCrc64, IntegrityCheckSha256)
+    , CompressionLevel(..)
+
     , LzmaAction(..)
+
+    -- * Variable-length integer
+    , LzmaVli(VliUnknown)
+    , pattern LzmaStreamHeaderSize
     ) where
 
 import           Control.Applicative
@@ -39,11 +82,57 @@ import qualified Data.ByteString.Internal as BS
 import qualified Data.ByteString.Unsafe as BS
 import           Data.Typeable
 import           Foreign
+import           Foreign.C.Types (CInt)
 import           Prelude
 
 #include <lzma.h>
 
 newtype LzmaStream = LS (ForeignPtr LzmaStream)
+
+-- | Get the number of available input bytes in the input buffer.
+getStreamAvailIn :: LzmaStream -> IO Int
+getStreamAvailIn (LS fptr) = withForeignPtr fptr (#peek lzma_stream, avail_in)
+
+-- | Set the number of available input bytes in the input buffer.
+setStreamAvailIn :: LzmaStream -> Int -> IO ()
+setStreamAvailIn (LS fptr) availIn =
+    withForeignPtr fptr $ \ptr -> (#poke lzma_stream, avail_in) ptr availIn
+
+-- | Get a pointer to the next input byte.
+getStreamNextIn :: LzmaStream -> IO (Ptr Word8)
+getStreamNextIn (LS fptr) = withForeignPtr fptr (#peek lzma_stream, next_in)
+
+-- | Set a pointer to the next input byte.
+setStreamNextIn :: LzmaStream -> Ptr Word8 -> IO ()
+setStreamNextIn (LS fptr) nextIn =
+    withForeignPtr fptr $ \ptr -> (#poke lzma_stream, next_in) ptr nextIn
+
+-- | Get a pointer to the next output position.
+getStreamNextOut :: LzmaStream -> IO (Ptr Word8)
+getStreamNextOut (LS fptr) = withForeignPtr fptr (#peek lzma_stream, next_out)
+
+-- | Set a pointer to the next input byte.
+setStreamNextOut :: LzmaStream -> Ptr Word8 -> IO ()
+setStreamNextOut (LS fptr) nextOut =
+    withForeignPtr fptr $ \ptr -> (#poke lzma_stream, next_out) ptr nextOut
+
+-- | Get the total number of bytes read by liblzma
+getStreamTotalIn :: LzmaStream -> IO Int
+getStreamTotalIn (LS fptr) = withForeignPtr fptr (#peek lzma_stream, total_in)
+
+-- | Set the total number of bytes read by liblzma
+setStreamTotalIn :: LzmaStream -> Int -> IO ()
+setStreamTotalIn (LS fptr) totalIn =
+    withForeignPtr fptr $ \ptr -> (#poke lzma_stream, total_in) ptr totalIn
+
+-- | Get the total number of bytes written by liblzma
+getStreamTotalOut :: LzmaStream -> IO Int
+getStreamTotalOut (LS fptr) = withForeignPtr fptr (#peek lzma_stream, total_out)
+
+-- | Set the total number of bytes written by liblzma
+setStreamTotalOut :: LzmaStream -> Int -> IO ()
+setStreamTotalOut (LS fptr) totalOut =
+    withForeignPtr fptr $ \ptr -> (#poke lzma_stream, total_out) ptr totalOut
 
 data LzmaRet = LzmaRetOK
              | LzmaRetStreamEnd
@@ -76,18 +165,27 @@ toLzmaRet i = case i of
     _                               -> Nothing
 
 -- | Integrity check type (only supported when compressing @.xz@ files)
-data IntegrityCheck = IntegrityCheckNone   -- ^ disable integrity check (not recommended)
-                    | IntegrityCheckCrc32  -- ^ CRC32 using the polynomial from IEEE-802.3
-                    | IntegrityCheckCrc64  -- ^ CRC64 using the polynomial from ECMA-182
-                    | IntegrityCheckSha256 -- ^ SHA-256
-                    deriving (Eq,Ord,Read,Show,Typeable)
+newtype IntegrityCheck = IC CInt deriving (Eq, Ord, Show, Typeable, Enum, Storable)
+{-# COMPLETE IntegrityCheckNone, IntegrityCheckCrc32, IntegrityCheckCrc64, IntegrityCheckSha256 #-}
+
+-- | Disable integrity check (not recommended)
+pattern IntegrityCheckNone :: IntegrityCheck
+pattern IntegrityCheckNone = IC (#const LZMA_CHECK_NONE)
+
+-- | CRC32 using the polynomial from IEEE-802.3
+pattern IntegrityCheckCrc32 :: IntegrityCheck
+pattern IntegrityCheckCrc32 = IC (#const LZMA_CHECK_CRC32)
+
+-- | CRC64 using the polynomial from ECMA-182
+pattern IntegrityCheckCrc64 :: IntegrityCheck
+pattern IntegrityCheckCrc64 = IC (#const LZMA_CHECK_CRC64)
+
+-- | SHA-256
+pattern IntegrityCheckSha256 :: IntegrityCheck
+pattern IntegrityCheckSha256 = IC (#const LZMA_CHECK_SHA256)
 
 fromIntegrityCheck :: IntegrityCheck -> Int
-fromIntegrityCheck lc = case lc of
-    IntegrityCheckNone   -> #const LZMA_CHECK_NONE
-    IntegrityCheckCrc32  -> #const LZMA_CHECK_CRC32
-    IntegrityCheckCrc64  -> #const LZMA_CHECK_CRC64
-    IntegrityCheckSha256 -> #const LZMA_CHECK_SHA256
+fromIntegrityCheck = fromEnum
 
 -- | Compression level presets that define the tradeoff between
 -- computational complexity and compression ratio
@@ -234,6 +332,65 @@ runLzmaStream (LS ls) ibs action0 buflen
 -- a programming error to call 'runLzmaStream' afterwards.
 endLzmaStream :: LzmaStream -> ST s ()
 endLzmaStream (LS ls) = unsafeIOToST $ finalizeForeignPtr ls
+
+newtype LzmaBlock = LB (ForeignPtr LzmaBlock)
+
+newBlock :: IO LzmaBlock
+newBlock = LB <$> mallocForeignPtrBytes (#size lzma_block)
+
+-- | Options for encoding/decoding stream headers and footers
+newtype LzmaStreamFlags = LSF (ForeignPtr LzmaStreamFlags)
+
+newStreamFlags :: IO LzmaStreamFlags
+newStreamFlags = undefined
+
+getStreamFlagsCheck :: LzmaStreamFlags -> IO IntegrityCheck
+getStreamFlagsCheck (LSF fptr) =
+    withForeignPtr fptr (#peek lzma_stream_flags, check)
+
+getStreamFlagsVersion :: LzmaStreamFlags -> IO Word32
+getStreamFlagsVersion (LSF fptr) =
+    withForeignPtr fptr (#peek lzma_stream_flags, version)
+
+getStreamFlagsBackwardSize :: LzmaStreamFlags -> IO LzmaVli
+getStreamFlagsBackwardSize (LSF fptr) =
+    withForeignPtr fptr (#peek lzma_stream_flags, backward_size)
+
+pattern LzmaStreamHeaderSize :: LzmaVli
+pattern LzmaStreamHeaderSize = #const LZMA_STREAM_HEADER_SIZE
+
+newtype LzmaIndex = LI (Ptr LzmaIndex) deriving Storable
+
+withIndexForeignPtr :: ForeignPtr LzmaIndex -> (LzmaIndex -> IO a) -> IO a
+withIndexForeignPtr fptr f = withForeignPtr fptr (peek >=> f)
+
+newtype LzmaIndexIter = LII (ForeignPtr LzmaIndexIter)
+
+-- | Variable-length integer
+--
+-- Valid 'LzmaVli' values are in the range [0, 'maxBound']. Unknown value is
+-- indicated with 'VliUnknown', which is the maximum value of the underlaying
+-- integer type.
+newtype LzmaVli = LzmaVli Word64
+    deriving (Eq, Ord, Num, Real, Integral, Bits, Storable)
+
+instance Show LzmaVli where
+    show (LzmaVli n) = show n
+
+instance Bounded LzmaVli where
+    minBound = LzmaVli 0
+    maxBound = LzmaVli (#const LZMA_VLI_MAX)
+
+instance Enum LzmaVli where
+    toEnum i
+        | i < 0 = error "LzmaVli should be greater than 0"
+        | i > (#const LZMA_VLI_MAX) =
+            error $ "LzmaVli should be smaller than " ++ show (maxBound :: LzmaVli)
+        | otherwise = LzmaVli $ toEnum i
+    fromEnum (LzmaVli n) = fromEnum n
+
+pattern VliUnknown :: LzmaVli
+pattern VliUnknown = LzmaVli (#const LZMA_VLI_UNKNOWN)
 
 ----------------------------------------------------------------------------
 -- trivial helper wrappers defined in ../cbits/lzma_wrapper.c
